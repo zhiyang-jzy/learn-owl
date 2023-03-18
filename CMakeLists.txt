@@ -14,4 +14,4 @@ embed_ptx( OUTPUT_TARGET
         device_code.cu)
 
 add_executable(learn_owl main.cpp)
-target_link_libraries(learn_owl PRIVATE  ptx owl::owl)
+target_link_libraries(learn_owl PRIVATE  ptx owl::owl owl_viewer)

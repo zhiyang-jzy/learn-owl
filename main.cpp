@@ -1,5 +1,5 @@
 // ======================================================================== //
-// Copyright 2019 Ingo Wald                                                 //
+// Copyright 2019-2020 Ingo Wald                                            //
 //                                                                          //
 // Licensed under the Apache License, Version 2.0 (the "License");          //
 // you may not use this file except in compliance with the License.         //
@@ -14,17 +14,19 @@
 // limitations under the License.                                           //
 // ======================================================================== //
 
-// This program shows a minimal setup: no geometry, just a ray generation
-// shader that accesses the pixels and draws a checkerboard pattern to
-// the output file ll00-rayGenOnly.png
+// This program sets up a single geometric object, a mesh for a cube, and
+// its acceleration structure, then ray traces it.
 
-// public owl API
-#include <owl/owl.h>
+// public owl node-graph API
+#include "owl/owl.h"
 // our device-side data structures
 #include "device_code.h"
-// external helper stuff for image output
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "third-party/stb_image_write.h"
+// viewer base class, for window and user interaction
+#include "owlViewer/OWLViewer.h"
+
+#define TINYOBJLOADER_IMPLEMENTATION
+
+#include "tiny_obj_loader.h"
 
 #define LOG(message)                                            \
   std::cout << OWL_TERMINAL_BLUE;                               \
@@ -37,106 +39,255 @@
 
 extern "C" char device_code_ptx[];
 
-// When run, this program produces this PNG as output.
-// In this case the correct result is a red and light gray checkerboard,
-// as nothing is actually rendered
-const char *outFileName = "s00-rayGenOnly.png";
-// image resolution
-const vec2i fbSize(800,600);
-// camera: unused in this sample, which generates no rays. TODO: delete?
-const vec3f lookFrom(-4.f,-3.f,-2.f);
-const vec3f lookAt(0.f,0.f,0.f);
-const vec3f lookUp(0.f,1.f,0.f);
-const float cosFovy = 0.66f;
+int NUM_VERTICES = 0;
+vec3f *vertices;
+int NUM_INDICES = 12;
+vec3i *indices;
 
-int main(int ac, char **av)
-{
-    // The output window will show comments for many of the methods called.
-    // Walking through the code line by line with a debugger is educational.
-    LOG("owl example '" << av[0] << "' starting up");
+// const vec2i fbSize(800,600);
+const vec3f init_lookFrom(-4.f, +3.f, -2.f);
+const vec3f init_lookAt(0.f, 0.f, 0.f);
+const vec3f init_lookUp(0.f, 1.f, 0.f);
+const float init_cosFovy = 0.66f;
+
+
+struct Viewer : public owl::viewer::OWLViewer {
+    Viewer();
+
+    /*! gets called whenever the viewer needs us to re-render out widget */
+    void render() override;
+
+    /*! window notifies us that we got resized. We HAVE to override
+        this to know our actual render dimensions, and get pointer
+        to the device frame buffer that the viewer cated for us */
+    void resize(const vec2i &newSize) override;
+
+    /*! this function gets called whenever any camera manipulator
+      updates the camera. gets called AFTER all values have been updated */
+    void cameraChanged() override;
+
+    bool sbtDirty = true;
+    OWLRayGen rayGen{0};
+    OWLContext context{0};
+};
+
+/*! window notifies us that we got resized */
+void Viewer::resize(const vec2i &newSize) {
+    OWLViewer::resize(newSize);
+    cameraChanged();
+}
+
+/*! window notifies us that the camera has changed */
+void Viewer::cameraChanged() {
+    const vec3f lookFrom = camera.getFrom();
+    const vec3f lookAt = camera.getAt();
+    const vec3f lookUp = camera.getUp();
+    const float cosFovy = camera.getCosFovy();
+    // ----------- compute variable values  ------------------
+    vec3f camera_pos = lookFrom;
+    vec3f camera_d00
+            = normalize(lookAt - lookFrom);
+    float aspect = fbSize.x / float(fbSize.y);
+    vec3f camera_ddu
+            = cosFovy * aspect * normalize(cross(camera_d00, lookUp));
+    vec3f camera_ddv
+            = cosFovy * normalize(cross(camera_ddu, camera_d00));
+    camera_d00 -= 0.5f * camera_ddu;
+    camera_d00 -= 0.5f * camera_ddv;
+
+    // ----------- set variables  ----------------------------
+    owlRayGenSet1ul(rayGen, "fbPtr", (uint64_t) fbPointer);
+    // owlRayGenSetBuffer(rayGen,"fbPtr",        frameBuffer);
+    owlRayGenSet2i(rayGen, "fbSize", (const owl2i &) fbSize);
+    owlRayGenSet3f(rayGen, "camera.pos", (const owl3f &) camera_pos);
+    owlRayGenSet3f(rayGen, "camera.dir_00", (const owl3f &) camera_d00);
+    owlRayGenSet3f(rayGen, "camera.dir_du", (const owl3f &) camera_ddu);
+    owlRayGenSet3f(rayGen, "camera.dir_dv", (const owl3f &) camera_ddv);
+    sbtDirty = true;
+}
+
+Viewer::Viewer() {
+    std::string inputfile = "Mesh000.obj";
+    tinyobj::ObjReaderConfig reader_config;
+    reader_config.mtl_search_path = "./"; // Path to material files
+
+    tinyobj::ObjReader reader;
+
+    if (!reader.ParseFromFile(inputfile, reader_config)) {
+        if (!reader.Error().empty()) {
+            std::cerr << "TinyObjReader: " << reader.Error();
+        }
+        exit(1);
+    }
+
+    if (!reader.Warning().empty()) {
+        std::cout << "TinyObjReader: " << reader.Warning();
+    }
+
+    auto &attrib = reader.GetAttrib();
+    auto &shapes = reader.GetShapes();
+
+    indices = new vec3i[shapes[0].mesh.indices.size()];
+    for (int i = 0; i < shapes[0].mesh.indices.size(); i += 3) {
+        int x = i / 3;
+        indices[x].x = shapes[0].mesh.indices[i].vertex_index;
+        indices[x].y = shapes[0].mesh.indices[i + 1].vertex_index;
+        indices[x].z = shapes[0].mesh.indices[i + 2].vertex_index;
+    }
+
+
+
+
+
+
+    // create a context on the first device:
+    context = owlContextCreate(nullptr, 1);
+    OWLModule module = owlModuleCreate(context, device_code_ptx);
 
     // ##################################################################
-    // set up all the *CODE* we want to run
+    // set up all the *GEOMETRY* graph we want to render
     // ##################################################################
 
-    LOG("building module, programs, and pipeline");
+    // -------------------------------------------------------
+    // declare geometry type
+    // -------------------------------------------------------
+    OWLVarDecl trianglesGeomVars[] = {
+            {"index",  OWL_BUFPTR, OWL_OFFSETOF(TrianglesGeomData, index)},
+            {"vertex", OWL_BUFPTR, OWL_OFFSETOF(TrianglesGeomData, vertex)},
+            {"color",  OWL_FLOAT3, OWL_OFFSETOF(TrianglesGeomData, color)},
+            {"normal",OWL_BUFPTR, OWL_OFFSETOF(TrianglesGeomData,normal)}
 
-    // Initialize CUDA and OptiX 7, and create an "owl device," a context to hold the
-    // ray generation shader and output buffer. The "1" is the number of devices requested.
-    OWLContext owl
-            = owlContextCreate(nullptr,1);
-    // PTX is the intermediate code that the CUDA deviceCode.cu shader program is converted into.
-    // You can see the machine-centric PTX code in
-    // build\samples\s00-rayGenOnly\cuda_compile_ptx_1_generated_deviceCode.cu.ptx_embedded.c
-    // This PTX intermediate code representation is then compiled into an OptiX module.
-    // See https://devblogs.nvidia.com/how-to-get-started-with-optix-7/ for more information.
-    OWLModule module
-            = owlModuleCreate(owl,device_code_ptx);
+    };
+    OWLGeomType trianglesGeomType
+            = owlGeomTypeCreate(context,
+                                OWL_TRIANGLES,
+                                sizeof(TrianglesGeomData),
+                                trianglesGeomVars, 4);
+    owlGeomTypeSetClosestHit(trianglesGeomType, 0,
+                             module, "TriangleMesh");
 
-    OWLVarDecl rayGenVars[]
+    // ##################################################################
+    // set up all the *GEOMS* we want to run that code on
+    // ##################################################################
+
+    LOG("building geometries ...");
+
+    // ------------------------------------------------------------------
+    // triangle mesh
+    // ------------------------------------------------------------------
+
+    NUM_VERTICES = attrib.vertices.size() / 3;
+    NUM_INDICES = shapes[0].mesh.indices.size() / 3;
+    OWLBuffer vertexBuffer
+            = owlDeviceBufferCreate(context, OWL_FLOAT3, NUM_VERTICES, attrib.vertices.data());
+    OWLBuffer indexBuffer
+            = owlDeviceBufferCreate(context, OWL_INT3, NUM_INDICES, indices);
+
+    OWLBuffer normalBuffer = owlDeviceBufferCreate(context,OWL_FLOAT3,NUM_VERTICES,attrib.normals.data());
+
+    // OWLBuffer frameBuffer
+    //   = owlHostPinnedBufferCreate(context,OWL_INT,fbSize.x*fbSize.y);
+
+    OWLGeom trianglesGeom
+            = owlGeomCreate(context, trianglesGeomType);
+
+    owlTrianglesSetVertices(trianglesGeom, vertexBuffer,
+                            NUM_VERTICES, sizeof(vec3f), 0);
+    owlTrianglesSetIndices(trianglesGeom, indexBuffer,
+                           NUM_INDICES, sizeof(vec3i), 0);
+
+    owlGeomSetBuffer(trianglesGeom, "vertex", vertexBuffer);
+    owlGeomSetBuffer(trianglesGeom, "index", indexBuffer);
+    owlGeomSetBuffer(trianglesGeom,"normal",normalBuffer);
+    owlGeomSet3f(trianglesGeom, "color", owl3f{0, 1, 0});
+
+    // ------------------------------------------------------------------
+    // the group/accel for that mesh
+    // ------------------------------------------------------------------
+    OWLGroup trianglesGroup
+            = owlTrianglesGeomGroupCreate(context, 1, &trianglesGeom);
+    owlGroupBuildAccel(trianglesGroup);
+    OWLGroup world
+            = owlInstanceGroupCreate(context, 1, &trianglesGroup);
+    owlGroupBuildAccel(world);
+
+
+    // ##################################################################
+    // set miss and raygen program required for SBT
+    // ##################################################################
+
+    // -------------------------------------------------------
+    // set up miss prog
+    // -------------------------------------------------------
+    OWLVarDecl missProgVars[]
             = {
-                    { "fbPtr",  OWL_BUFPTR, OWL_OFFSETOF(RayGenData,fbPtr) },
-                    { "fbSize", OWL_INT2,   OWL_OFFSETOF(RayGenData,fbSize) },
-                    { "color0", OWL_FLOAT3, OWL_OFFSETOF(RayGenData,color0) },
-                    { "color1", OWL_FLOAT3, OWL_OFFSETOF(RayGenData,color1) },
-                    { /* sentinel: */ nullptr }
+                    {"color0", OWL_FLOAT3, OWL_OFFSETOF(MissProgData, color0)},
+                    {"color1", OWL_FLOAT3, OWL_OFFSETOF(MissProgData, color1)},
+                    { /* sentinel to mark end of list */ }
             };
-    // Allocate room for one RayGen shader, create it, and
-    // hold on to it with the "owl" context
-    OWLRayGen rayGen
-            = owlRayGenCreate(owl,module,"simpleRayGen",
-                              sizeof(RayGenData),rayGenVars,-1);
+    // ----------- create object  ----------------------------
+    OWLMissProg missProg
+            = owlMissProgCreate(context, module, "miss", sizeof(MissProgData),
+                                missProgVars, -1);
 
-    // (re-)builds all optix programs, with current pipeline settings
-    owlBuildPrograms(owl);
-    // Create the pipeline. Note that owl will (kindly) warn there are no geometry and no miss programs defined.
-    owlBuildPipeline(owl);
+    // ----------- set variables  ----------------------------
+    owlMissProgSet3f(missProg, "color0", owl3f{.8f, 0.f, 0.f});
+    owlMissProgSet3f(missProg, "color1", owl3f{.8f, .8f, .8f});
 
-    // ------------------------------------------------------------------
-    // alloc buffers
-    // ------------------------------------------------------------------
-    LOG("allocating frame buffer");
-    // Create a frame buffer as page-locked, aka "pinned" memory. See CUDA documentation for benefits and more info.
-    OWLBuffer
-            frameBuffer = owlHostPinnedBufferCreate(owl,
-            /*type:*/OWL_INT,
-            /*size:*/fbSize.x*fbSize.y);
+    // -------------------------------------------------------
+    // set up ray gen program
+    // -------------------------------------------------------
+    OWLVarDecl rayGenVars[] = {
+            {"fbPtr",         OWL_RAW_POINTER, OWL_OFFSETOF(RayGenData, fbPtr)},
+            // { "fbPtr",         OWL_BUFPTR, OWL_OFFSETOF(RayGenData,fbPtr)},
+            {"fbSize",        OWL_INT2,        OWL_OFFSETOF(RayGenData, fbSize)},
+            {"world",         OWL_GROUP,       OWL_OFFSETOF(RayGenData, world)},
+            {"camera.pos",    OWL_FLOAT3,      OWL_OFFSETOF(RayGenData, camera.pos)},
+            {"camera.dir_00", OWL_FLOAT3,      OWL_OFFSETOF(RayGenData, camera.dir_00)},
+            {"camera.dir_du", OWL_FLOAT3,      OWL_OFFSETOF(RayGenData, camera.dir_du)},
+            {"camera.dir_dv", OWL_FLOAT3,      OWL_OFFSETOF(RayGenData, camera.dir_dv)},
+            { /* sentinel to mark end of list */ }
+    };
 
-    // ------------------------------------------------------------------
-    // build Shader Binding Table (SBT) required to trace the groups
-    // ------------------------------------------------------------------
+    // ----------- create object  ----------------------------
+    rayGen
+            = owlRayGenCreate(context, module, "simpleRayGen",
+                              sizeof(RayGenData),
+                              rayGenVars, -1);
+    /* camera and frame buffer get set in resiez() and cameraChanged() */
+    owlRayGenSetGroup(rayGen, "world", world);
 
-    owlRayGenSet3f(rayGen,"color0",.8f,0.f,0.f);
-    owlRayGenSet3f(rayGen,"color1",.8f,.8f,.8f);
-    owlRayGenSetBuffer(rayGen,"fbPtr",frameBuffer);
-    owlRayGenSet2i(rayGen,"fbSize",fbSize.x,fbSize.y);
-    // Build a shader binding table entry for the ray generation record.
-    owlBuildSBT(owl);
+    // ##################################################################
+    // build *SBT* required to trace the groups
+    // ##################################################################
+
+    owlBuildPrograms(context);
+    owlBuildPipeline(context);
+    owlBuildSBT(context);
+}
+
+void Viewer::render() {
+    if (sbtDirty) {
+        owlBuildSBT(context);
+        sbtDirty = false;
+    }
+    owlRayGenLaunch2D(rayGen, fbSize.x, fbSize.y);
+}
+
+
+int main(int ac, char **av) {
+    LOG("owl::ng example '" << av[0] << "' starting up");
+
+    Viewer viewer;
+    viewer.camera.setOrientation(init_lookFrom,
+                                 init_lookAt,
+                                 init_lookUp,
+                                 owl::viewer::toDegrees(acosf(init_cosFovy)));
+    viewer.enableFlyMode();
+    viewer.enableInspectMode(owl::box3f(vec3f(-1.f), vec3f(+1.f)));
 
     // ##################################################################
     // now that everything is ready: launch it ....
     // ##################################################################
-
-    LOG("executing the launch ...");
-    // Normally launching without a hit or miss shader causes OptiX to trigger warnings.
-    // Owl's wrapper call here will set up fake hit and miss records into the SBT to avoid these.
-    owlRayGenLaunch2D(rayGen,fbSize.x,fbSize.y);
-
-    LOG("done with launch, writing frame buffer to " << outFileName);
-    const uint32_t *fb = (const uint32_t*)owlBufferGetPointer(frameBuffer,0);
-    stbi_write_png(outFileName,fbSize.x,fbSize.y,4,
-                   fb,fbSize.x*sizeof(uint32_t));
-    LOG_OK("written rendered frame buffer to file "<<outFileName);
-
-    // ##################################################################
-    // and finally, clean up
-    // ##################################################################
-
-    LOG("cleaning up ...");
-    //owlModuleRelease(module);
-    //owlRayGenRelease(rayGen);
-    //owlBufferRelease(frameBuffer);
-    //owlContextDestroy(owl);
-
-    LOG_OK("seems all went OK; app is done, this should be the last output ...");
+    viewer.showAndRun();
 }

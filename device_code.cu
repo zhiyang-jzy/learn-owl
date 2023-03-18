@@ -1,5 +1,5 @@
 // ======================================================================== //
-// Copyright 2019 Ingo Wald                                                 //
+// Copyright 2019-2020 Ingo Wald                                            //
 //                                                                          //
 // Licensed under the Apache License, Version 2.0 (the "License");          //
 // you may not use this file except in compliance with the License.         //
@@ -14,41 +14,103 @@
 // limitations under the License.                                           //
 // ======================================================================== //
 
-// Ray gen shader for ll00-rayGenOnly. No actual rays are harmed in the making of
-// this shader. The pixel location is simply translated into a checkerboard pattern.
-
 #include "device_code.h"
 #include <optix_device.h>
 
-// OPTIX_RAYGEN_PROGRAM() is a simple macro defined in deviceAPI.h to add standard
-// code for defining a shader method.
-// It puts:
-//   extern "C" __global__ void __raygen__##programName
-// in front of the program name given
 OPTIX_RAYGEN_PROGRAM(simpleRayGen)()
 {
-    // read in the program data set by the calling program hostCode.cpp using lloSbtRayGensBuild;
-    // see RayGenData in deviceCode.h
     const RayGenData &self = owl::getProgramData<RayGenData>();
-    // Under the hood, OptiX maps rays generated in CUDA thread blocks to a pixel ID,
-    // where the ID is a 2D vector, 0 to frame buffer width-1, 0 to height-1
     const vec2i pixelID = owl::getLaunchIndex();
     if (pixelID == owl::vec2i(0)) {
-        // the first thread ID is always (0,0), so we can generate a message to show things are working
         printf("%sHello OptiX From your First RayGen Program%s\n",
                OWL_TERMINAL_CYAN,
                OWL_TERMINAL_DEFAULT);
     }
 
-    // Generate a simple checkerboard pattern as a test. Note that the upper left corner is pixel (0,0).
-    int pattern = (pixelID.x / 8) ^ (pixelID.y / 8);
-    // alternate pattern, showing that pixel (0,0) is in the upper left corner
-    // pattern = (pixelID.x*pixelID.x + pixelID.y*pixelID.y) / 100000;
-    const vec3f color = vec3f(float(pixelID.x)/self.fbSize.x,float(pixelID.y)/self.fbSize.y,0);
+    vec3f light_pos(3,3,3);
 
-    // find the frame buffer location (x + width*y) and put the "computed" result there
+    const vec2f screen = (vec2f(pixelID)+vec2f(.5f)) / vec2f(self.fbSize);
+    owl::Ray ray;
+    ray.origin
+            = self.camera.pos;
+    ray.direction
+            = normalize(self.camera.dir_00
+                        + screen.u * self.camera.dir_du
+                        + screen.v * self.camera.dir_dv);
+
+    RayData rayData;
+    owl::traceRay(/*accel to trace against*/self.world,
+            /*the ray to trace*/ray,
+            /*prd*/rayData);
+
+    vec3f color(1,1,1);
+
     const int fbOfs = pixelID.x+self.fbSize.x*pixelID.y;
-    self.fbPtr[fbOfs]
-            = owl::make_rgba(color);
+    if(rayData.hit)
+    {
+
+        vec3f normal = normalize(rayData.normal);
+        vec3f light_dir = normalize(light_pos-rayData.point);
+        vec3f view_dir = normalize(ray.origin-rayData.point);
+        vec3f halfway_dir = normalize(light_dir+view_dir);
+
+        vec3f ambient = 0.05f * color;//环境光
+
+
+        float diff = max(dot(light_dir,normal), 0.f);
+        vec3f diffuse = diff * color; //漫反射
+
+        float spec = pow(max(dot(normal,halfway_dir), 0.f), 128);
+        vec3f specular = vec3f(0.3, 0.3, 0.3) * spec;// 镜面反射
+
+        vec3f res = ambient + diffuse + specular;
+
+
+        self.fbPtr[fbOfs]
+                = owl::make_rgba(res);
+    }
+    else
+        self.fbPtr[fbOfs] = owl::make_rgba(vec3f(0));
+}
+
+OPTIX_CLOSEST_HIT_PROGRAM(TriangleMesh)()
+{
+    RayData &prd = owl::getPRD<RayData>();
+
+    const TrianglesGeomData &self = owl::getProgramData<TrianglesGeomData>();
+
+    // compute normal:
+    const int   primID = optixGetPrimitiveIndex();
+    const vec3i index  = self.index[primID];
+
+//    const vec3f Ng     = normalize(cross(B-A,C-A));
+    vec2f uv =  optixGetTriangleBarycentrics();
+    vec3f normal
+            = (1.f-uv.x-uv.y)*self.normal[index.x]
+              +      uv.x      *self.normal[index.y]
+              +           uv.y *self.normal[index.z];
+    normal = normalize(normal);
+    optixTransformNormalFromObjectToWorldSpace(normal);
+
+    const vec3f org  = optixGetWorldRayOrigin();
+    const vec3f dir  = optixGetWorldRayDirection();
+    const float hit_t = optixGetRayTmax();
+    const vec3f hit_P = org + hit_t * dir;
+    prd.normal = normal;
+    prd.point = hit_P;
+    prd.hit = true;
+
+}
+
+OPTIX_MISS_PROGRAM(miss)()
+{
+    const vec2i pixelID = owl::getLaunchIndex();
+
+    const MissProgData &self = owl::getProgramData<MissProgData>();
+
+    RayData &prd = owl::getPRD<RayData>();
+    int pattern = (pixelID.x / 8) ^ (pixelID.y/8);
+    prd.hit = false;
+
 }
 
